@@ -133,29 +133,27 @@ def render_video(frame_path: str, video_path: str, duration: int) -> subprocess.
 
     cmd = ["ffmpeg", "-y"]
 
-    # Входы
+    # Все входы должны идти ДО выходных опций
     cmd += ["-loop", "1", "-i", frame_path]
     if has_music:
         cmd += ["-i", music_path]
+    else:
+        cmd += ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"]
 
-    # Видео-кодек
+    # Выходные опции (видео)
     cmd += [
+        "-vf", f"scale={WIDTH}:{HEIGHT}",
         "-c:v", "libx264",
         "-t", str(duration),
         "-pix_fmt", "yuv420p",
-        "-vf", f"scale={WIDTH}:{HEIGHT}",
         "-r", "30",
     ]
 
-    # Аудио
+    # Выходные опции (аудио)
     if has_music:
         cmd += ["-c:a", "aac", "-b:a", "128k", "-shortest"]
     else:
-        # Тишина (без аудиодорожки некоторые платформы ругаются)
-        cmd += [
-            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-            "-c:a", "aac", "-shortest",
-        ]
+        cmd += ["-c:a", "aac", "-shortest"]
 
     cmd.append(video_path)
 
