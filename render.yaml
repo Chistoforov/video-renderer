@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: video-renderer
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars: []
