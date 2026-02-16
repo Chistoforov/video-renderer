@@ -4,9 +4,11 @@ import time
 import subprocess
 import threading
 import gc
+import urllib.request
+import urllib.parse
 
 from flask import Flask, request, jsonify, send_from_directory
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 app = Flask(__name__)
 
@@ -29,6 +31,50 @@ GRADIENT_TOP = (72, 22, 96)
 GRADIENT_BOTTOM = (18, 10, 48)
 DEFAULT_DURATION = 15
 CLEANUP_AFTER = 600
+
+# Промпт для авто-генерации фона через Pollinations.ai (бесплатно, без ключа)
+BG_PROMPT = (
+    "aesthetic dark moody background for instagram reels, "
+    "soft bokeh lights, purple and blue tones, abstract, "
+    "no text, no people, cinematic"
+)
+
+
+def fetch_background(prompt: str, width: int, height: int) -> Image.Image | None:
+    """Генерирует фон через Pollinations.ai (бесплатно, без API-ключа)."""
+    try:
+        encoded = urllib.parse.quote(prompt)
+        url = f"https://image.pollinations.ai/prompt/{encoded}?width={width}&height={height}&nologo=true"
+        tmp_path = os.path.join(OUTPUT_DIR, f"_bg_{uuid.uuid4().hex[:8]}.jpg")
+
+        urllib.request.urlretrieve(url, tmp_path)
+        img = Image.open(tmp_path).convert("RGB").resize((width, height))
+
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+        return img
+    except Exception:
+        return None
+
+
+def download_image(url: str, width: int, height: int) -> Image.Image | None:
+    """Скачивает картинку по URL и подгоняет под нужный размер."""
+    try:
+        tmp_path = os.path.join(OUTPUT_DIR, f"_dl_{uuid.uuid4().hex[:8]}.jpg")
+        urllib.request.urlretrieve(url, tmp_path)
+        img = Image.open(tmp_path).convert("RGB").resize((width, height))
+
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+        return img
+    except Exception:
+        return None
 
 
 def create_gradient(width: int, height: int, top: tuple, bottom: tuple) -> Image.Image:
@@ -77,17 +123,40 @@ def load_font(size: int) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default(size)
 
 
-def create_frame(text: str, output_path: str) -> None:
-    """Генерирует кадр 1080x1920 с текстом вопроса (оптимизировано по памяти)."""
+def darken_background(img: Image.Image) -> Image.Image:
+    """Затемняет и слегка размывает фон, чтобы текст читался."""
+    img = img.filter(ImageFilter.GaussianBlur(radius=3))
+    dark = Image.new("RGB", img.size, (0, 0, 0))
+    return Image.blend(img, dark, alpha=0.4)
 
-    # --- Фон (работаем в RGB, не RGBA — экономим 25% памяти) ---
-    bg_path = os.path.join(ASSETS_DIR, "background.jpg")
-    if os.path.exists(bg_path):
-        img = Image.open(bg_path).resize((WIDTH, HEIGHT)).convert("RGB")
-    else:
+
+def create_frame(text: str, output_path: str, background_url: str = None, generate_bg: bool = False) -> None:
+    """Генерирует кадр 720x1280 с текстом вопроса."""
+
+    img = None
+
+    # Приоритет 1: переданный URL картинки
+    if background_url:
+        img = download_image(background_url, WIDTH, HEIGHT)
+
+    # Приоритет 2: AI-генерация через Pollinations
+    if img is None and generate_bg:
+        img = fetch_background(BG_PROMPT, WIDTH, HEIGHT)
+
+    # Приоритет 3: локальный файл assets/background.jpg
+    if img is None:
+        bg_path = os.path.join(ASSETS_DIR, "background.jpg")
+        if os.path.exists(bg_path):
+            img = Image.open(bg_path).resize((WIDTH, HEIGHT)).convert("RGB")
+
+    # Приоритет 4: градиент (фолбэк)
+    if img is None:
         img = create_gradient(WIDTH, HEIGHT, GRADIENT_TOP, GRADIENT_BOTTOM)
 
-    # Используем временный RGBA-слой только для бокса, потом сразу удаляем
+    # Затемняем фон (кроме градиента — он и так тёмный)
+    if background_url or generate_bg:
+        img = darken_background(img)
+
     draw = ImageDraw.Draw(img)
     font = load_font(FONT_SIZE)
 
@@ -100,7 +169,7 @@ def create_frame(text: str, output_path: str) -> None:
     tx = (WIDTH - tw) / 2
     ty = (HEIGHT - th) / 2
 
-    # Полупрозрачный бокс — рисуем только маленький кусок, не полный 1080x1920
+    # Полупрозрачный бокс за текстом
     box_x1 = int(tx - BOX_PADDING)
     box_y1 = int(ty - BOX_PADDING)
     box_x2 = int(tx + tw + BOX_PADDING)
@@ -116,12 +185,10 @@ def create_frame(text: str, output_path: str) -> None:
         fill=BOX_COLOR,
     )
 
-    # Вырезаем кусок фона, накладываем бокс, вставляем обратно
     region = img.crop((box_x1, box_y1, box_x2, box_y2)).convert("RGBA")
     region = Image.alpha_composite(region, box_overlay)
     img.paste(region.convert("RGB"), (box_x1, box_y1))
 
-    # Освобождаем память
     del box_overlay, region, box_draw
     gc.collect()
 
@@ -140,7 +207,6 @@ def create_frame(text: str, output_path: str) -> None:
 
     img.save(output_path, quality=90)
 
-    # Освобождаем память
     del img, draw
     gc.collect()
 
@@ -153,14 +219,12 @@ def render_video(frame_path: str, video_path: str, duration: int) -> subprocess.
 
     cmd = ["ffmpeg", "-y"]
 
-    # Все входы ДО выходных опций
     cmd += ["-loop", "1", "-i", frame_path]
     if has_music:
         cmd += ["-i", music_path]
     else:
         cmd += ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"]
 
-    # Выходные опции (видео) — ultrafast preset для минимума памяти
     cmd += [
         "-vf", f"scale={WIDTH}:{HEIGHT}",
         "-c:v", "libx264",
@@ -172,7 +236,6 @@ def render_video(frame_path: str, video_path: str, duration: int) -> subprocess.
         "-threads", "1",
     ]
 
-    # Аудио
     if has_music:
         cmd += ["-c:a", "aac", "-b:a", "96k", "-shortest"]
     else:
@@ -202,8 +265,14 @@ def schedule_cleanup(path: str) -> None:
 def render():
     """
     POST /render
-    Body JSON: { "text": "Текст вопроса", "duration": 15 }
-    Response:  { "video_url": "https://.../video/<id>.mp4" }
+    Body JSON:
+      {
+        "text": "Текст вопроса",
+        "duration": 15,
+        "background_url": "https://...",   (опционально — своя картинка)
+        "generate_bg": true                (опционально — AI-генерация фона)
+      }
+    Response: { "video_url": "https://.../video/<id>.mp4" }
     """
     data = request.get_json(force=True)
     text = data.get("text", "").strip()
@@ -212,17 +281,19 @@ def render():
         return jsonify({"error": "text is required"}), 400
 
     duration = int(data.get("duration", DEFAULT_DURATION))
+    background_url = data.get("background_url")
+    generate_bg = data.get("generate_bg", False)
+
     vid = str(uuid.uuid4())
     frame_path = os.path.join(OUTPUT_DIR, f"{vid}.jpg")
     video_path = os.path.join(OUTPUT_DIR, f"{vid}.mp4")
 
     # 1. Создаём кадр
-    create_frame(text, frame_path)
+    create_frame(text, frame_path, background_url=background_url, generate_bg=generate_bg)
 
     # 2. Рендерим видео
     result = render_video(frame_path, video_path, duration)
 
-    # Удаляем кадр
     try:
         os.remove(frame_path)
     except OSError:
