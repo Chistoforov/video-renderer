@@ -17,12 +17,12 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ---------------------------------------------------------------------------
 # Визуальные настройки (можно менять)
 # ---------------------------------------------------------------------------
-WIDTH = 1080
-HEIGHT = 1920
-FONT_SIZE = 60
+WIDTH = 720
+HEIGHT = 1280
+FONT_SIZE = 44
 TEXT_COLOR = (255, 255, 255)
-TEXT_PADDING = 80
-BOX_PADDING = 40
+TEXT_PADDING = 56
+BOX_PADDING = 28
 BOX_RADIUS = 24
 BOX_COLOR = (0, 0, 0, 90)
 GRADIENT_TOP = (72, 22, 96)
