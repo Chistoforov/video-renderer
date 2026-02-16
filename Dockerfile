@@ -24,5 +24,5 @@ RUN wget -q -O assets/font.ttf \
 
 EXPOSE 5000
 
-# Gunicorn с таймаутом 120 сек (рендер может занять до минуты)
-CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:5000", "--timeout", "120", "--workers", "2"]
+# 1 воркер — экономим память на Free Tier (512MB)
+CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:5000", "--timeout", "120", "--workers", "1"]

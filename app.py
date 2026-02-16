@@ -3,8 +3,8 @@ import uuid
 import time
 import subprocess
 import threading
+import gc
 
-import numpy as np
 from flask import Flask, request, jsonify, send_from_directory
 from PIL import Image, ImageDraw, ImageFont
 
@@ -21,22 +21,30 @@ WIDTH = 1080
 HEIGHT = 1920
 FONT_SIZE = 60
 TEXT_COLOR = (255, 255, 255)
-TEXT_PADDING = 80           # отступ текста от краёв кадра
-BOX_PADDING = 40            # отступ бокса вокруг текста
+TEXT_PADDING = 80
+BOX_PADDING = 40
 BOX_RADIUS = 24
-BOX_COLOR = (0, 0, 0, 90)  # полупрозрачный чёрный фон за текстом
-GRADIENT_TOP = (72, 22, 96)     # фиолетовый
-GRADIENT_BOTTOM = (18, 10, 48)  # тёмно-синий
-DEFAULT_DURATION = 15       # длительность видео в секундах
-CLEANUP_AFTER = 600         # удалять файлы через N секунд
+BOX_COLOR = (0, 0, 0, 90)
+GRADIENT_TOP = (72, 22, 96)
+GRADIENT_BOTTOM = (18, 10, 48)
+DEFAULT_DURATION = 15
+CLEANUP_AFTER = 600
 
 
 def create_gradient(width: int, height: int, top: tuple, bottom: tuple) -> Image.Image:
-    """Вертикальный градиент сверху вниз."""
-    arr = np.zeros((height, width, 3), dtype=np.uint8)
-    for ch in range(3):
-        arr[:, :, ch] = np.linspace(top[ch], bottom[ch], height).reshape(-1, 1)
-    return Image.fromarray(arr)
+    """Вертикальный градиент — без numpy, чистый Pillow."""
+    img = Image.new("RGB", (width, height))
+    pixels = img.load()
+
+    for y in range(height):
+        ratio = y / height
+        r = int(top[0] + (bottom[0] - top[0]) * ratio)
+        g = int(top[1] + (bottom[1] - top[1]) * ratio)
+        b = int(top[2] + (bottom[2] - top[2]) * ratio)
+        for x in range(width):
+            pixels[x, y] = (r, g, b)
+
+    return img
 
 
 def wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int, draw: ImageDraw.Draw) -> str:
@@ -70,22 +78,19 @@ def load_font(size: int) -> ImageFont.FreeTypeFont:
 
 
 def create_frame(text: str, output_path: str) -> None:
-    """Генерирует кадр 1080x1920 с текстом вопроса."""
+    """Генерирует кадр 1080x1920 с текстом вопроса (оптимизировано по памяти)."""
 
-    # --- Фон ---
+    # --- Фон (работаем в RGB, не RGBA — экономим 25% памяти) ---
     bg_path = os.path.join(ASSETS_DIR, "background.jpg")
     if os.path.exists(bg_path):
-        img = Image.open(bg_path).resize((WIDTH, HEIGHT)).convert("RGBA")
-        # Затемняющий оверлей
-        dark = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 100))
-        img = Image.alpha_composite(img, dark)
+        img = Image.open(bg_path).resize((WIDTH, HEIGHT)).convert("RGB")
     else:
-        img = create_gradient(WIDTH, HEIGHT, GRADIENT_TOP, GRADIENT_BOTTOM).convert("RGBA")
+        img = create_gradient(WIDTH, HEIGHT, GRADIENT_TOP, GRADIENT_BOTTOM)
 
+    # Используем временный RGBA-слой только для бокса, потом сразу удаляем
     draw = ImageDraw.Draw(img)
     font = load_font(FONT_SIZE)
 
-    # --- Текст ---
     max_text_w = WIDTH - TEXT_PADDING * 2
     wrapped = wrap_text(text, font, max_text_w, draw)
 
@@ -95,26 +100,37 @@ def create_frame(text: str, output_path: str) -> None:
     tx = (WIDTH - tw) / 2
     ty = (HEIGHT - th) / 2
 
-    # Полупрозрачный бокс за текстом
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    ov_draw = ImageDraw.Draw(overlay)
-    ov_draw.rounded_rectangle(
-        [
-            tx - BOX_PADDING,
-            ty - BOX_PADDING,
-            tx + tw + BOX_PADDING,
-            ty + th + BOX_PADDING,
-        ],
+    # Полупрозрачный бокс — рисуем только маленький кусок, не полный 1080x1920
+    box_x1 = int(tx - BOX_PADDING)
+    box_y1 = int(ty - BOX_PADDING)
+    box_x2 = int(tx + tw + BOX_PADDING)
+    box_y2 = int(ty + th + BOX_PADDING)
+    box_w = box_x2 - box_x1
+    box_h = box_y2 - box_y1
+
+    box_overlay = Image.new("RGBA", (box_w, box_h), (0, 0, 0, 0))
+    box_draw = ImageDraw.Draw(box_overlay)
+    box_draw.rounded_rectangle(
+        [0, 0, box_w, box_h],
         radius=BOX_RADIUS,
         fill=BOX_COLOR,
     )
-    img = Image.alpha_composite(img, overlay)
+
+    # Вырезаем кусок фона, накладываем бокс, вставляем обратно
+    region = img.crop((box_x1, box_y1, box_x2, box_y2)).convert("RGBA")
+    region = Image.alpha_composite(region, box_overlay)
+    img.paste(region.convert("RGB"), (box_x1, box_y1))
+
+    # Освобождаем память
+    del box_overlay, region, box_draw
+    gc.collect()
+
     draw = ImageDraw.Draw(img)
 
     # Тень текста
     draw.multiline_text(
         (tx + 2, ty + 2), wrapped, font=font,
-        fill=(0, 0, 0, 180), align="center", spacing=20,
+        fill=(0, 0, 0), align="center", spacing=20,
     )
     # Основной текст
     draw.multiline_text(
@@ -122,7 +138,11 @@ def create_frame(text: str, output_path: str) -> None:
         fill=TEXT_COLOR, align="center", spacing=20,
     )
 
-    img.convert("RGB").save(output_path, quality=95)
+    img.save(output_path, quality=90)
+
+    # Освобождаем память
+    del img, draw
+    gc.collect()
 
 
 def render_video(frame_path: str, video_path: str, duration: int) -> subprocess.CompletedProcess:
@@ -133,25 +153,28 @@ def render_video(frame_path: str, video_path: str, duration: int) -> subprocess.
 
     cmd = ["ffmpeg", "-y"]
 
-    # Все входы должны идти ДО выходных опций
+    # Все входы ДО выходных опций
     cmd += ["-loop", "1", "-i", frame_path]
     if has_music:
         cmd += ["-i", music_path]
     else:
         cmd += ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"]
 
-    # Выходные опции (видео)
+    # Выходные опции (видео) — ultrafast preset для минимума памяти
     cmd += [
         "-vf", f"scale={WIDTH}:{HEIGHT}",
         "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "28",
         "-t", str(duration),
         "-pix_fmt", "yuv420p",
-        "-r", "30",
+        "-r", "24",
+        "-threads", "1",
     ]
 
-    # Выходные опции (аудио)
+    # Аудио
     if has_music:
-        cmd += ["-c:a", "aac", "-b:a", "128k", "-shortest"]
+        cmd += ["-c:a", "aac", "-b:a", "96k", "-shortest"]
     else:
         cmd += ["-c:a", "aac", "-shortest"]
 
@@ -211,7 +234,6 @@ def render():
     base_url = request.host_url.rstrip("/")
     video_url = f"{base_url}/video/{vid}.mp4"
 
-    # Авто-удаление через 10 минут
     schedule_cleanup(video_path)
 
     return jsonify({"video_url": video_url, "video_id": vid})
