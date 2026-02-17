@@ -242,17 +242,47 @@ def create_frame(text: str, output_path: str, background_url: str = None, genera
     return bg_source
 
 
-def render_video(frame_path: str, video_path: str, duration: int) -> subprocess.CompletedProcess:
-    """Собирает MP4 из кадра + (опционально) музыки через FFmpeg."""
+def download_file(url: str, dest_path: str, timeout: int = 60) -> bool:
+    """Скачивает файл по URL и сохраняет на диск."""
+    try:
+        logging.info("Downloading file from: %s", url[:200])
+        req = urllib.request.Request(url, headers={"User-Agent": "VideoRenderer/1.0"})
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        data = resp.read()
+        logging.info("File downloaded, size=%d bytes", len(data))
 
-    music_path = os.path.join(ASSETS_DIR, "music.mp3")
-    has_music = os.path.exists(music_path)
+        if len(data) < 1000:
+            logging.warning("File too small (%d bytes), likely an error", len(data))
+            return False
+
+        with open(dest_path, "wb") as f:
+            f.write(data)
+        return True
+    except Exception as e:
+        logging.error("File download failed: %s", e)
+        return False
+
+
+def render_video(frame_path: str, video_path: str, duration: int,
+                 music_file: str | None = None) -> subprocess.CompletedProcess:
+    """Собирает MP4 из кадра + музыки через FFmpeg."""
+
+    # Приоритет: переданный файл → локальный assets/music.mp3 → тишина
+    local_music = os.path.join(ASSETS_DIR, "music.mp3")
+    if music_file and os.path.exists(music_file):
+        audio_source = music_file
+    elif os.path.exists(local_music):
+        audio_source = local_music
+    else:
+        audio_source = None
+
+    logging.info("render_video: audio_source=%s", audio_source)
 
     cmd = ["ffmpeg", "-y"]
 
     cmd += ["-loop", "1", "-i", frame_path]
-    if has_music:
-        cmd += ["-i", music_path]
+    if audio_source:
+        cmd += ["-i", audio_source]
     else:
         cmd += ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"]
 
@@ -267,8 +297,8 @@ def render_video(frame_path: str, video_path: str, duration: int) -> subprocess.
         "-threads", "1",
     ]
 
-    if has_music:
-        cmd += ["-c:a", "aac", "-b:a", "96k", "-shortest"]
+    if audio_source:
+        cmd += ["-c:a", "aac", "-b:a", "128k", "-shortest"]
     else:
         cmd += ["-c:a", "aac", "-shortest"]
 
@@ -301,9 +331,10 @@ def render():
         "text": "Текст вопроса",
         "duration": 15,
         "background_url": "https://...",   (опционально — своя картинка)
-        "generate_bg": true                (опционально — AI-генерация фона)
+        "generate_bg": true,               (опционально — AI-генерация фона)
+        "music_url": "https://...mp3"      (опционально — ссылка на mp3)
       }
-    Response: { "video_url": "https://.../video/<id>.mp4" }
+    Response: { "video_url": "...", "background": "...", "music": "..." }
     """
     data = request.get_json(force=True)
     text = data.get("text", "").strip()
@@ -314,21 +345,40 @@ def render():
     duration = int(data.get("duration", DEFAULT_DURATION))
     background_url = data.get("background_url")
     generate_bg = data.get("generate_bg", False)
+    music_url = data.get("music_url")
 
     vid = str(uuid.uuid4())
     frame_path = os.path.join(OUTPUT_DIR, f"{vid}.jpg")
     video_path = os.path.join(OUTPUT_DIR, f"{vid}.mp4")
+    music_path = os.path.join(OUTPUT_DIR, f"{vid}_music.mp3")
 
-    # 1. Создаём кадр
+    # 1. Скачиваем музыку (если передан URL)
+    music_source = "silent"
+    if music_url:
+        if download_file(music_url, music_path, timeout=60):
+            music_source = "url"
+        else:
+            music_path = None
+    else:
+        music_path = None
+
+    # Проверяем локальный файл
+    if music_source == "silent" and os.path.exists(os.path.join(ASSETS_DIR, "music.mp3")):
+        music_source = "local"
+
+    # 2. Создаём кадр
     bg_source = create_frame(text, frame_path, background_url=background_url, generate_bg=generate_bg)
 
-    # 2. Рендерим видео
-    result = render_video(frame_path, video_path, duration)
+    # 3. Рендерим видео
+    result = render_video(frame_path, video_path, duration, music_file=music_path)
 
-    try:
-        os.remove(frame_path)
-    except OSError:
-        pass
+    # Очистка временных файлов
+    for tmp in [frame_path, music_path]:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
     if result.returncode != 0:
         return jsonify({"error": "ffmpeg failed", "details": result.stderr}), 500
@@ -338,7 +388,12 @@ def render():
 
     schedule_cleanup(video_path)
 
-    return jsonify({"video_url": video_url, "video_id": vid, "background": bg_source})
+    return jsonify({
+        "video_url": video_url,
+        "video_id": vid,
+        "background": bg_source,
+        "music": music_source,
+    })
 
 
 @app.route("/video/<filename>")
