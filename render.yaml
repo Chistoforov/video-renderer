@@ -4,4 +4,6 @@ services:
     runtime: docker
     plan: free
     healthCheckPath: /health
-    envVars: []
+    envVars:
+      - key: POLLINATIONS_KEY
+        sync: false

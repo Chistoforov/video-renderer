@@ -1,14 +1,18 @@
 import os
+import io
 import uuid
 import time
 import subprocess
 import threading
 import gc
+import logging
 import urllib.request
 import urllib.parse
 
 from flask import Flask, request, jsonify, send_from_directory
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
+
+logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
 
@@ -40,41 +44,46 @@ BG_PROMPT = (
 )
 
 
-def fetch_background(prompt: str, width: int, height: int) -> Image.Image | None:
-    """Генерирует фон через Pollinations.ai (бесплатно, без API-ключа)."""
+def _download(url: str, width: int, height: int, label: str = "image", timeout: int = 60) -> Image.Image | None:
+    """Скачивает картинку по URL и подгоняет под нужный размер."""
     try:
-        encoded = urllib.parse.quote(prompt)
-        url = f"https://image.pollinations.ai/prompt/{encoded}?width={width}&height={height}&nologo=true"
-        tmp_path = os.path.join(OUTPUT_DIR, f"_bg_{uuid.uuid4().hex[:8]}.jpg")
+        logging.info("Downloading %s from: %s", label, url[:200])
+        req = urllib.request.Request(url, headers={"User-Agent": "VideoRenderer/1.0"})
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        data = resp.read()
+        logging.info("%s downloaded, size=%d bytes, content-type=%s",
+                     label, len(data), resp.headers.get("Content-Type", "?"))
 
-        urllib.request.urlretrieve(url, tmp_path)
-        img = Image.open(tmp_path).convert("RGB").resize((width, height))
+        if len(data) < 1000:
+            logging.warning("%s too small (%d bytes), likely an error page", label, len(data))
+            return None
 
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-
+        img = Image.open(io.BytesIO(data)).convert("RGB").resize((width, height))
         return img
-    except Exception:
+    except Exception as e:
+        logging.error("%s download failed: %s", label, e)
         return None
+
+
+def fetch_ai_background(prompt: str, width: int, height: int) -> Image.Image | None:
+    """Генерирует фон через Pollinations.ai (новый API gen.pollinations.ai)."""
+    api_key = os.environ.get("POLLINATIONS_KEY", "")
+    encoded = urllib.parse.quote(prompt)
+    url = f"https://gen.pollinations.ai/image/{encoded}?model=flux&width={width}&height={height}&nologo=true"
+    if api_key:
+        url += f"&key={api_key}"
+    return _download(url, width, height, label="AI background", timeout=90)
+
+
+def fetch_random_photo(width: int, height: int) -> Image.Image | None:
+    """Загружает случайное фото с picsum.photos (бесплатно, без ключа)."""
+    url = f"https://picsum.photos/{width}/{height}"
+    return _download(url, width, height, label="random photo", timeout=30)
 
 
 def download_image(url: str, width: int, height: int) -> Image.Image | None:
-    """Скачивает картинку по URL и подгоняет под нужный размер."""
-    try:
-        tmp_path = os.path.join(OUTPUT_DIR, f"_dl_{uuid.uuid4().hex[:8]}.jpg")
-        urllib.request.urlretrieve(url, tmp_path)
-        img = Image.open(tmp_path).convert("RGB").resize((width, height))
-
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-
-        return img
-    except Exception:
-        return None
+    """Скачивает картинку по пользовательскому URL."""
+    return _download(url, width, height, label="custom background", timeout=60)
 
 
 def create_gradient(width: int, height: int, top: tuple, bottom: tuple) -> Image.Image:
@@ -124,37 +133,57 @@ def load_font(size: int) -> ImageFont.FreeTypeFont:
 
 
 def darken_background(img: Image.Image) -> Image.Image:
-    """Затемняет и слегка размывает фон, чтобы текст читался."""
-    img = img.filter(ImageFilter.GaussianBlur(radius=3))
+    """Затемняет, блюрит и тонирует фон в фиолетовый, чтобы текст читался."""
+    img = img.filter(ImageFilter.GaussianBlur(radius=6))
+    # Фиолетовый оверлей для единого стиля
+    tint = Image.new("RGB", img.size, (50, 15, 70))
+    img = Image.blend(img, tint, alpha=0.35)
+    # Дополнительное затемнение
     dark = Image.new("RGB", img.size, (0, 0, 0))
-    return Image.blend(img, dark, alpha=0.4)
+    return Image.blend(img, dark, alpha=0.25)
 
 
-def create_frame(text: str, output_path: str, background_url: str = None, generate_bg: bool = False) -> None:
+def create_frame(text: str, output_path: str, background_url: str = None, generate_bg: bool = False) -> str:
     """Генерирует кадр 720x1280 с текстом вопроса."""
 
+    logging.info("create_frame called: background_url=%s, generate_bg=%s", background_url, generate_bg)
     img = None
+    bg_source = "gradient"
 
     # Приоритет 1: переданный URL картинки
     if background_url:
         img = download_image(background_url, WIDTH, HEIGHT)
+        if img:
+            bg_source = "custom_url"
 
-    # Приоритет 2: AI-генерация через Pollinations
+    # Приоритет 2: AI-генерация через Pollinations (если явно запрошено)
     if img is None and generate_bg:
-        img = fetch_background(BG_PROMPT, WIDTH, HEIGHT)
+        img = fetch_ai_background(BG_PROMPT, WIDTH, HEIGHT)
+        if img:
+            bg_source = "ai_pollinations"
 
-    # Приоритет 3: локальный файл assets/background.jpg
+    # Приоритет 3: случайное фото с Picsum (если generate_bg=true, а Pollinations не сработал)
+    if img is None and generate_bg:
+        img = fetch_random_photo(WIDTH, HEIGHT)
+        if img:
+            bg_source = "random_photo"
+
+    # Приоритет 4: локальный файл assets/background.jpg
     if img is None:
         bg_path = os.path.join(ASSETS_DIR, "background.jpg")
         if os.path.exists(bg_path):
             img = Image.open(bg_path).resize((WIDTH, HEIGHT)).convert("RGB")
+            bg_source = "local"
 
-    # Приоритет 4: градиент (фолбэк)
+    # Приоритет 5: градиент (фолбэк)
     if img is None:
         img = create_gradient(WIDTH, HEIGHT, GRADIENT_TOP, GRADIENT_BOTTOM)
+        bg_source = "gradient"
 
-    # Затемняем фон (кроме градиента — он и так тёмный)
-    if background_url or generate_bg:
+    logging.info("Background source used: %s", bg_source)
+
+    # Затемняем и тонируем фон (кроме градиента — он и так тёмный)
+    if bg_source != "gradient":
         img = darken_background(img)
 
     draw = ImageDraw.Draw(img)
@@ -209,6 +238,8 @@ def create_frame(text: str, output_path: str, background_url: str = None, genera
 
     del img, draw
     gc.collect()
+
+    return bg_source
 
 
 def render_video(frame_path: str, video_path: str, duration: int) -> subprocess.CompletedProcess:
@@ -289,7 +320,7 @@ def render():
     video_path = os.path.join(OUTPUT_DIR, f"{vid}.mp4")
 
     # 1. Создаём кадр
-    create_frame(text, frame_path, background_url=background_url, generate_bg=generate_bg)
+    bg_source = create_frame(text, frame_path, background_url=background_url, generate_bg=generate_bg)
 
     # 2. Рендерим видео
     result = render_video(frame_path, video_path, duration)
@@ -307,7 +338,7 @@ def render():
 
     schedule_cleanup(video_path)
 
-    return jsonify({"video_url": video_url, "video_id": vid})
+    return jsonify({"video_url": video_url, "video_id": vid, "background": bg_source})
 
 
 @app.route("/video/<filename>")
